@@ -2,10 +2,11 @@ package org.apache.spark.ml.made
 
 import scala.util.control.Breaks._
 import breeze.linalg
-import breeze.linalg.{DenseVector => BDV, Vector => BV}
+import breeze.linalg.{*, DenseMatrix => BDM, DenseVector => BDV, Matrix => BM, Vector => BV}
+import breeze.stats.mean
 import org.apache.hadoop.fs.Path
 import org.apache.spark.internal.Logging
-import org.apache.spark.ml.{PredictorParams}
+import org.apache.spark.ml.PredictorParams
 import org.apache.spark.ml.linalg.BLAS.dot
 import org.apache.spark.ml.param.{DoubleParam, ParamMap, ParamValidators, Params}
 import org.apache.spark.ml.regression.{RegressionModel, Regressor}
@@ -18,6 +19,8 @@ import org.apache.spark.mllib.stat.MultivariateOnlineSummarizer
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.{Dataset, Encoder, Row}
 import org.apache.spark.mllib
+
+import scala.collection.mutable.ArrayBuffer
 
 
 trait HasLR extends Params {
@@ -70,19 +73,37 @@ class LinearRegressionGD(override val uid: String)
 
     // Main loop
     breakable { for (i <- 1 to getMaxIter) {
-      // Calculate coefficientsSummary over data
       val (coefficientsSummary, interceptSummary) = vectors.rdd.mapPartitions((data: Iterator[(Vector, Double)]) => {
         val coefficientsSummarizer = new MultivariateOnlineSummarizer()
         val interceptSummarizer = new MultivariateOnlineSummarizer()
 
-        data.foreach(r => {
-          val x: linalg.Vector[Double] = r._1.asBreeze
-          val y: Double = r._2
-          val yhat: Double = (x dot coefficients) + intercept
-          val residual: Double = y - yhat
+        data.grouped(1000).foreach((r: Seq[(Vector, Double)]) => {
+          // Let's try to create matrix from this group
 
-          coefficientsSummarizer.add(mllib.linalg.Vectors.fromBreeze(x * residual))
-          interceptSummarizer.add(mllib.linalg.Vectors.dense(residual))
+          // Create array of numbers for matrix and vector column
+          val (x_, y_) = r.map(x => (
+            x._1.toArray.to[ArrayBuffer], Array(x._2).to[ArrayBuffer]
+          )).reduce((x, y) => {
+            (x._1 ++ y._1, x._2 ++ y._2)
+          })
+
+          // Create breeze matrix and dense vector
+          val x__ = x_.toArray
+          val y__ = y_.toArray
+          val X = BDM.create(x__.size / numFeatures, numFeatures, x__, 0, numFeatures, true)
+          val Y = BDV(y__)
+
+          // Calculate current values
+          var Yhat = (X * coefficients) + intercept
+
+          // Calculate residuals
+          val residuals = Y - Yhat
+
+          // Calculate coefficients step
+          val c: BDM[Double] = X(::, *) * residuals
+
+          coefficientsSummarizer.add(mllib.linalg.Vectors.fromBreeze(mean(c(::, *)).t))
+          interceptSummarizer.add(mllib.linalg.Vectors.dense(mean(residuals)))
         })
 
         Iterator((coefficientsSummarizer, interceptSummarizer))
